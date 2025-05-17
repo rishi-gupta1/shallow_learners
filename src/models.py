@@ -1,99 +1,112 @@
+import torch
 import torch.nn as nn
 from omegaconf import DictConfig
 
 
 def get_model(cfg: DictConfig):
-    # Create model based on configuration
     model_kwargs = {k: v for k, v in cfg.model.items() if k != "type"}
     model_kwargs["n_input_channels"] = len(cfg.data.input_vars)
     model_kwargs["n_output_channels"] = len(cfg.data.output_vars)
-    if cfg.model.type == "simple_cnn":
-        model = SimpleCNN(**model_kwargs)
+    if cfg.model.type == "unet_residual":
+        model = UNetWithResiduals(**model_kwargs)
     else:
         raise ValueError(f"Unknown model type: {cfg.model.type}")
     return model
 
+def center_crop(tensor, target_size):
+    _, _, h, w = tensor.size()
+    target_h, target_w = target_size
+    start_h = (h - target_h) // 2
+    start_w = (w - target_w) // 2
+    return tensor[:, :, start_h:start_h + target_h, start_w:start_w + target_w]
 
-# --- Model Architectures ---
 
+# --- Core Components ---
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1):
+    def __init__(self, in_channels, out_channels, kernel_size=3):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=kernel_size // 2)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size // 2)
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, padding=kernel_size // 2)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
-        # Skip connection
-        self.skip = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
+        self.skip = nn.Identity()
+        if in_channels != out_channels:
             self.skip = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride), nn.BatchNorm2d(out_channels)
+                nn.Conv2d(in_channels, out_channels, kernel_size=1),
+                nn.BatchNorm2d(out_channels)
             )
 
     def forward(self, x):
-        identity = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-
-        out += self.skip(identity)
-        out = self.relu(out)
-
-        return out
+        identity = self.skip(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += identity
+        return self.relu(out)
 
 
-class SimpleCNN(nn.Module):
-    def __init__(
-        self,
-        n_input_channels,
-        n_output_channels,
-        kernel_size=3,
-        init_dim=64,
-        depth=4,
-        dropout_rate=0.2,
-    ):
+class DownBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-
-        # Initial convolution to expand channels
-        self.initial = nn.Sequential(
-            nn.Conv2d(n_input_channels, init_dim, kernel_size=kernel_size, padding=kernel_size // 2),
-            nn.BatchNorm2d(init_dim),
-            nn.ReLU(inplace=True),
-        )
-
-        # Residual blocks with increasing feature dimensions
-        self.res_blocks = nn.ModuleList()
-        current_dim = init_dim
-
-        for i in range(depth):
-            out_dim = current_dim * 2 if i < depth - 1 else current_dim
-            self.res_blocks.append(ResidualBlock(current_dim, out_dim))
-            if i < depth - 1:  # Don't double the final layer
-                current_dim *= 2
-
-        # Final prediction layers
-        self.dropout = nn.Dropout2d(dropout_rate)
-        self.final = nn.Sequential(
-            nn.Conv2d(current_dim, current_dim // 2, kernel_size=kernel_size, padding=kernel_size // 2),
-            nn.BatchNorm2d(current_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(current_dim // 2, n_output_channels, kernel_size=1),
-        )
+        self.res = ResidualBlock(in_channels, out_channels)
+        self.pool = nn.MaxPool2d(2)
 
     def forward(self, x):
-        x = self.initial(x)
+        x = self.res(x)
+        skip = x
+        x = self.pool(x)
+        return x, skip
 
-        for res_block in self.res_blocks:
-            x = res_block(x)
+
+class UpBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.res = ResidualBlock(in_channels, out_channels)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        skip = center_crop(skip, x.shape[2:])
+        x = torch.cat((x, skip), dim=1)
+        return self.res(x)
+
+
+class UNetWithResiduals(nn.Module):
+    def __init__(self, n_input_channels, n_output_channels, base_dim=64, depth=3, dropout_rate=0.1):
+        super().__init__()
+        self.depth = depth
+
+        self.down_blocks = nn.ModuleList()
+        self.up_blocks = nn.ModuleList()
+
+        dims = [base_dim * 2**i for i in range(depth)]
+
+        in_ch = n_input_channels
+        for out_ch in dims:
+            self.down_blocks.append(DownBlock(in_ch, out_ch))
+            in_ch = out_ch
+
+        self.middle = ResidualBlock(dims[-1], dims[-1] * 2)
+
+        for i in range(depth - 1, -1, -1):
+            up_in = dims[i+1] if i < depth - 1 else dims[-1] * 2
+            self.up_blocks.append(UpBlock(up_in, dims[i]))
+
+        self.dropout = nn.Dropout2d(dropout_rate)
+        self.out = nn.Conv2d(base_dim, n_output_channels * 2, kernel_size=1) 
+
+    def forward(self, x):
+        skips = []
+        for down in self.down_blocks:
+            x, skip = down(x)
+            skips.append(skip)
+
+        x = self.middle(x)
+
+        for up, skip in zip(self.up_blocks, reversed(skips)):
+            x = up(x, skip)
 
         x = self.dropout(x)
-        x = self.final(x)
-
-        return x
+        return self.out(x).chunk(2, dim=1) 
