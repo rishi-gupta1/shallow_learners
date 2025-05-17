@@ -212,6 +212,9 @@ class ClimateEmulationDataModule(LightningDataModule):
             input_std = da.nanstd(train_input_dask, axis=(0, 2, 3), keepdims=True).compute()
             output_mean = da.nanmean(train_output_dask, axis=(0, 2, 3), keepdims=True).compute()
             output_std = da.nanstd(train_output_dask, axis=(0, 2, 3), keepdims=True).compute()
+            output_mean = output_mean.reshape(1, -1, 1, 1)
+            output_std = output_std.reshape(1, -1, 1, 1)
+
 
             self.normalizer.set_input_statistics(mean=input_mean, std=input_std)
             self.normalizer.set_output_statistics(mean=output_mean, std=output_std)
@@ -225,6 +228,11 @@ class ClimateEmulationDataModule(LightningDataModule):
             val_output_norm_dask = self.normalizer.normalize(val_output_dask, data_type="output")
 
             # --- Prepare Test Data ---
+            for member in [0, 1, 2]:
+                tas_test_check = ds["tas"].sel(ssp="ssp245", member_id=member)
+                mean_val = tas_test_check.isel(time=0).mean().values
+                print(f"Member {member} tas mean at time 0: {mean_val}")
+
             full_test_input_dask, full_test_output_dask = _load_process_ssp_data(
                 ds,
                 self.hparams.test_ssp,
@@ -243,6 +251,9 @@ class ClimateEmulationDataModule(LightningDataModule):
             # --- Define Normalized Test Input Dask Array ---
             test_input_norm_dask = self.normalizer.normalize(sliced_test_input_dask, data_type="input")
             test_output_raw_dask = sliced_test_output_raw_dask  # Keep unnormed for evaluation
+
+            tas_test_sample = sliced_test_output_raw_dask[:1].compute()
+            print("Debug: tas sample mean in test slice:", tas_test_sample[:, 0].mean().item())
 
         # Create datasets
         self.train_dataset = ClimateDataset(train_input_norm_dask, train_output_norm_dask, output_is_normalized=True)
@@ -330,20 +341,24 @@ class ClimateEmulationModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y_true_norm = batch
-        y_pred_norm = self(x)
+        y_pred_norm,_ = self(x)
         loss = self.criterion(y_pred_norm, y_true_norm)
         self.log("train/loss", loss, prog_bar=True, batch_size=x.size(0))
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y_true_norm = batch
-        y_pred_norm = self(x)
+        y_pred_norm,_ = self(x)
         loss = self.criterion(y_pred_norm, y_true_norm)
         self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=x.size(0), sync_dist=True)
 
         # Save unnormalized outputs for decadal mean/stddev calculation in validation_epoch_end
-        y_pred_norm = self.normalizer.inverse_transform_output(y_pred_norm.cpu().numpy())
-        y_true_norm = self.normalizer.inverse_transform_output(y_true_norm.cpu().numpy())
+        assert self.normalizer.mean_out is not None, "Normalizer output mean is None!"
+        assert self.normalizer.std_out is not None, "Normalizer output std is None!"
+        y_pred_norm = self.normalizer.inverse_transform_output(y_pred_norm.detach().cpu().numpy())
+        y_true_norm = self.normalizer.inverse_transform_output(y_true_norm.detach().cpu().numpy())
+        
+
         self.validation_step_outputs.append((y_pred_norm, y_true_norm))
 
         return loss
@@ -459,10 +474,12 @@ class ClimateEmulationModule(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         x, y_true_denorm = batch
-        y_pred_norm = self(x)
+        y_pred_norm,_ = self(x)
         # Denormalize the predictions for evaluation back to original scale
-        y_pred_denorm = self.normalizer.inverse_transform_output(y_pred_norm.cpu().numpy())
+        y_pred_denorm = self.normalizer.inverse_transform_output(y_pred_norm.detach().cpu().numpy())
         y_true_denorm_np = y_true_denorm.cpu().numpy()
+        print("tas pred mean:", np.mean(y_pred_denorm[:, 0]))
+        print("tas target mean:", np.mean(y_true_denorm_np[:, 0]))
         self.test_step_outputs.append((y_pred_denorm, y_true_denorm_np))
 
     def on_test_epoch_end(self):
