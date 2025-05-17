@@ -15,6 +15,8 @@ from lightning.pytorch import LightningDataModule
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
+from typing import Optional
+
 
 
 try:
@@ -22,7 +24,7 @@ try:
 except ImportError:
     wandb = None
 
-from src.models import get_model
+from src.models import ClimateLoss, get_model
 from src.utils import (
     Normalizer,
     calculate_weighted_metric,
@@ -127,6 +129,7 @@ def _load_process_ssp_data(ds, ssp, input_variables, output_variables, member_id
     # Stack outputs along channel dimension -> dask array (time, channels, y, x)
     stacked_output_dask = da.stack(output_dasks, axis=1)
     return stacked_input_dask, stacked_output_dask
+    
 
 
 class ClimateEmulationDataModule(LightningDataModule):
@@ -162,7 +165,7 @@ class ClimateEmulationDataModule(LightningDataModule):
             raise FileNotFoundError(f"Data path not found: {self.hparams.path}")
         log.info(f"Data found at: {self.hparams.path}")
 
-    def setup(self, stage: str | None = None):
+    def setup(self, stage: Optional[str] = None):
         log.info(f"Setting up data module for stage: {stage} from {self.hparams.path}")
 
         # Use context manager for opening dataset
@@ -316,7 +319,7 @@ class ClimateEmulationModule(pl.LightningModule):
         self.model = model
         # Access hyperparams via self.hparams object after saving, e.g., self.hparams.learning_rate
         self.save_hyperparameters(ignore=["model"])
-        self.criterion = nn.MSELoss()
+        self.criterion = ClimateLoss() 
         self.normalizer = None
         # Store evaluation outputs for time-mean calculation
         self.test_step_outputs = []
