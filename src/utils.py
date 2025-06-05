@@ -62,8 +62,8 @@ class Normalizer:
             std: Standard deviation value(s) for output normalization
         """
         log.info(f"Setting output normalizer with mean shape: {mean.shape}, std shape: {std.shape}")
-        self.mean_out = mean
-        self.std_out = std
+        self.mean_out = np.asarray(mean).reshape(1, -1, 1, 1)
+        self.std_out = np.asarray(std).reshape(1, -1, 1, 1)
 
     def normalize(self, data, data_type="input"):
         """
@@ -105,6 +105,7 @@ class Normalizer:
             raise RuntimeError("Must fit output normalizer before inverse transforming")
 
         # Handles broadcasting correctly
+        data_norm = np.asarray(data_norm)
         denormalized = data_norm * self.std_out + self.mean_out
         return denormalized
 
