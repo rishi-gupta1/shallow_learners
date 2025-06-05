@@ -26,17 +26,18 @@ def center_crop(tensor, target_size):
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3):
         super().__init__()
+        num_groups = 8
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size // 2)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn1 = nn.GroupNorm(num_groups, out_channels)
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, padding=kernel_size // 2)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.GroupNorm(num_groups, out_channels)
 
         self.skip = nn.Identity()
         if in_channels != out_channels:
             self.skip = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1),
-                nn.BatchNorm2d(out_channels)
+                nn.GroupNorm(num_groups, out_channels)
             )
 
     def forward(self, x):
@@ -74,7 +75,7 @@ class UpBlock(nn.Module):
 
 
 class UNetWithResiduals(nn.Module):
-    def __init__(self, n_input_channels, n_output_channels, base_dim=64, depth=3, dropout_rate=0.1):
+    def __init__(self, n_input_channels, n_output_channels, base_dim=256, depth=3, dropout_rate=0.1):
         super().__init__()
         self.depth = depth
 
