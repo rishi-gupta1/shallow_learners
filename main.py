@@ -139,7 +139,7 @@ class ClimateEmulationDataModule(LightningDataModule):
         test_ssp: str,
         target_member_id: int,
         test_months: int = 360,
-        batch_size: int = 32,
+        batch_size: int = 16,
         eval_batch_size: int = None,
         num_workers: int = 0,
         seed: int = 42,
@@ -528,8 +528,9 @@ class ClimateEmulationModule(pl.LightningModule):
         log.info(f"Kaggle submission saved to {filepath}")
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-        return optimizer
+        optimizer = optim.AdamW(self.parameters(), lr=self.hparams.learning_rate, weight_decay = 1e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+        return [optimizer], [scheduler]
 
 
 # --- Main Execution with Hydra ---
@@ -559,6 +560,9 @@ def main(cfg: DictConfig):
     trainer.fit(lightning_module, datamodule=datamodule, ckpt_path=cfg.ckpt_path)
     log.info("Training finished.")
 
+    worst_samples = find_worst_validation_samples(model, datamodule)
+    plot_error_patterns(worst_samples, datamodule)
+
     # Test model
     # IMPORTANT: Please note that the test metrics will be bad because the test targets have been corrupted on the public Kaggle dataset.
     # The purpose of testing below is to generate the Kaggle submission file based on your model's predictions.
@@ -569,6 +573,75 @@ def main(cfg: DictConfig):
     if cfg.use_wandb and isinstance(trainer_config.get("logger"), WandbLogger):
         wandb.finish()  # Finish the run if using wandb
 
+def find_worst_validation_samples(model, datamodule, num_samples=3):
+    val_loader = datamodule.val_dataloader()
+    worst_samples = []  # (error, x, y_true, y_pred)
+    
+    model.eval()
+    with torch.no_grad():
+        for x, y_true in val_loader:
+            y_pred, _ = model(x)
+            errors = torch.mean((y_pred - y_true)**2, dim=(1,2,3))  # Per-sample MSE
+            
+            for i in range(len(errors)):
+                if len(worst_samples) < num_samples or errors[i] > worst_samples[0][0]:
+                    worst_samples.append((
+                        errors[i].item(),
+                        x[i].cpu(),
+                        y_true[i].cpu(),
+                        y_pred[i].cpu()
+                    ))
+                    worst_samples.sort(reverse=True, key=lambda x: x[0])
+                    worst_samples = worst_samples[:num_samples]
+    print(f"Worst samples are {worst_samples}")
+    
+    return worst_samples
+
+
+def plot_error_patterns(worst_samples, datamodule):
+    """Visualize true/pred/error for worst samples"""
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+    
+    # Get coordinates
+    print("tryna plot itttttttttt")
+    lats, lons = datamodule.get_coords()
+    extent = [lons.min(), lons.max(), lats.min(), lats.max()]
+    
+    for i, (error, x, y_true, y_pred) in enumerate(worst_samples):
+        # Denormalize
+        y_true = datamodule.normalizer.inverse_transform_output(y_true.unsqueeze(0).numpy())[0]
+        y_pred = datamodule.normalizer.inverse_transform_output(y_pred.unsqueeze(0).numpy())[0]
+        error_map = y_true - y_pred
+        
+        # Create figure
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        fig.suptitle(f'Top Error Sample #{i+1} (MSE: {error:.2f})', fontsize=14)
+        
+        # Temperature plots
+        for ax, data, title in zip(axes,
+                                 [y_true[0], y_pred[0], error_map[0]],
+                                 ['True Temperature (K)', 
+                                  'Predicted Temperature (K)', 
+                                  'Error (True - Pred)']):
+            im = ax.imshow(data, cmap='coolwarm', extent=extent, origin='lower')
+            ax.set_title(title)
+            
+            # Add colorbar
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size="5%", pad=0.1)
+            plt.colorbar(im, cax=cax)
+            
+            # Add coastlines (optional - requires cartopy)
+            try:
+                import cartopy.crs as ccrs
+                ax.coastlines(resolution='110m', color='black', linewidth=0.5)
+            except ImportError:
+                pass
+        
+        plt.tight_layout()
+        plt.savefig(f'worst_sample_{i+1}_error_{error:.2f}.png', dpi=300, bbox_inches='tight')
+        plt.close()
 
 if __name__ == "__main__":
     main()
